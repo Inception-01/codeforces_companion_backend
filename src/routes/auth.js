@@ -1,4 +1,5 @@
 import express from 'express';
+import bcrypt from 'bcryptjs';
 import { queryOne, execute } from '../db.js';
 import {
   fetchUserInfo,
@@ -8,6 +9,7 @@ import {
   pickVerificationProblem,
 } from '../cfApi.js';
 import { setUserCookie, clearUserCookie, COOKIE_UID } from '../utils/cookies.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -17,10 +19,12 @@ const formatUser = (user) => {
   if (typeof parsedTags === 'string') {
     try { parsedTags = JSON.parse(parsedTags); } catch { parsedTags = []; }
   }
-  return { ...user, selected_tags: parsedTags };
+  // Never expose password hash to the client
+  const { password_hash, ...safeUser } = user;
+  return { ...safeUser, selected_tags: parsedTags };
 };
 
-// Step 1: Request verification code for signup/login
+// Step 1: Request verification code for signup
 router.post('/request-verification', async (req, res) => {
   try {
     const { handle } = req.body;
@@ -34,7 +38,7 @@ router.post('/request-verification', async (req, res) => {
     try {
       await fetchUserInfo(trimmedHandle);
     } catch (cfErr) {
-      return res.status(400).json({ error: `Codeforces handle "${trimmedHandle}" was not found.` });
+      return res.status(400).json({ error: `Codeforces handle "${trimmedHandle}" was not found on Codeforces.` });
     }
 
     // Generate verification code and pick a random problem
@@ -64,7 +68,7 @@ router.post('/request-verification', async (req, res) => {
       problemUrl,
       problemContestId: problem.contestId,
       problemIndex: problem.index,
-      instructions: `Submit this code to Codeforces problem ${problem.contestId}${problem.index} using C++ (GNU G++17 or similar). It will produce a compilation error. Then click "I've Submitted" to verify.`,
+      instructions: `Submit this code to Codeforces problem ${problem.contestId}${problem.index}. It will produce a compilation error. Then choose a password and click "Verify & Create Account".`,
     });
   } catch (error) {
     console.error('Error requesting verification:', error);
@@ -72,12 +76,15 @@ router.post('/request-verification', async (req, res) => {
   }
 });
 
-// Step 2: Verify the submission
+// Step 2: Verify submission and create user with password
 router.post('/verify', async (req, res) => {
   try {
-    const { handle } = req.body;
+    const { handle, password } = req.body;
     if (!handle || typeof handle !== 'string' || !handle.trim()) {
       return res.status(400).json({ error: 'Handle is required' });
+    }
+    if (!password || typeof password !== 'string' || password.length < 6) {
+      return res.status(400).json({ error: 'Password is required and must be at least 6 characters' });
     }
 
     const trimmedHandle = handle.trim();
@@ -85,10 +92,10 @@ router.post('/verify', async (req, res) => {
     // Get stored verification code
     const record = await queryOne('SELECT * FROM verification_codes WHERE handle = $1', [trimmedHandle]);
     if (!record) {
-      return res.status(400).json({ error: 'No verification code requested for this handle. Call /request-verification first.' });
+      return res.status(400).json({ error: 'No verification code requested for this handle. Please start signup first.' });
     }
 
-    // Check if code is not too old (30 minutes)
+    // Check if code is not expired (30 minutes)
     const createdAt = new Date(record.created_at).getTime();
     if (Date.now() - createdAt > 30 * 60 * 1000) {
       return res.status(400).json({ error: 'Verification code expired. Request a new one.' });
@@ -102,7 +109,7 @@ router.post('/verify', async (req, res) => {
     if (!verified) {
       const problemUrl = `https://codeforces.com/problemset/problem/${problemContestId}/${problemIndex}`;
       return res.status(400).json({
-        error: `No recent C++ compilation error submission found on problem ${problemContestId}${problemIndex}. Please submit the verification code snippet and try again.`,
+        error: `No recent compilation error submission found on problem ${problemContestId}${problemIndex} for "${trimmedHandle}". Make sure you submitted the snippet to Codeforces and received "Compilation error".`,
         codeSnippet: generateVerificationCodeSnippet(record.code),
         problemUrl,
       });
@@ -111,15 +118,23 @@ router.post('/verify', async (req, res) => {
     // Mark verification as complete
     await execute('UPDATE verification_codes SET verified_at = NOW() WHERE handle = $1', [trimmedHandle]);
 
-    // Create or get user
-    await execute('INSERT INTO users (handle) VALUES ($1) ON CONFLICT (handle) DO NOTHING', [trimmedHandle]);
+    // Hash the password securely
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Create or update user with password_hash
+    await execute(
+      `INSERT INTO users (handle, password_hash)
+       VALUES ($1, $2)
+       ON CONFLICT (handle) DO UPDATE SET password_hash = $2, updated_at = NOW()`,
+      [trimmedHandle, passwordHash]
+    );
     const user = await queryOne('SELECT * FROM users WHERE handle = $1', [trimmedHandle]);
 
     setUserCookie(res, user);
 
     res.json({
       user: formatUser(user),
-      message: 'Successfully verified and logged in!',
+      message: 'Account created and verified successfully!',
     });
   } catch (error) {
     console.error('Error verifying:', error);
@@ -127,12 +142,15 @@ router.post('/verify', async (req, res) => {
   }
 });
 
-// Login for existing registered users
+// Login for registered users with handle + password
 router.post('/login', async (req, res) => {
   try {
-    const { handle } = req.body;
+    const { handle, password } = req.body;
     if (!handle || typeof handle !== 'string' || !handle.trim()) {
       return res.status(400).json({ error: 'Codeforces handle is required' });
+    }
+    if (!password || typeof password !== 'string') {
+      return res.status(400).json({ error: 'Password is required' });
     }
 
     const trimmedHandle = handle.trim();
@@ -145,6 +163,18 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    // If user has a password_hash set, compare it
+    if (user.password_hash) {
+      const isValid = await bcrypt.compare(password, user.password_hash);
+      if (!isValid) {
+        return res.status(401).json({ error: 'Invalid handle or password' });
+      }
+    } else {
+      // Legacy user without password — set the password on first login
+      const passwordHash = await bcrypt.hash(password, 10);
+      await execute('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, user.id]);
+    }
+
     setUserCookie(res, user);
 
     res.json({
@@ -154,6 +184,39 @@ router.post('/login', async (req, res) => {
   } catch (error) {
     console.error('Error logging in:', error);
     res.status(500).json({ error: error.message || 'Failed to log in' });
+  }
+});
+
+// Change Password for authenticated user
+router.post('/change-password', requireAuth, async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body;
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    }
+
+    const user = await queryOne('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (user.password_hash) {
+      if (!oldPassword) {
+        return res.status(400).json({ error: 'Current password is required' });
+      }
+      const isValid = await bcrypt.compare(oldPassword, user.password_hash);
+      if (!isValid) {
+        return res.status(401).json({ error: 'Current password is incorrect' });
+      }
+    }
+
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await execute('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [newHash, user.id]);
+
+    res.json({ ok: true, message: 'Password updated successfully' });
+  } catch (error) {
+    console.error('Error changing password:', error);
+    res.status(500).json({ error: error.message || 'Failed to change password' });
   }
 });
 

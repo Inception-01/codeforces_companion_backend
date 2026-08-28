@@ -12,7 +12,8 @@ const formatUser = (user) => {
   if (typeof parsedTags === 'string') {
     try { parsedTags = JSON.parse(parsedTags); } catch { parsedTags = []; }
   }
-  return { ...user, selected_tags: parsedTags };
+  const { password_hash, ...safeUser } = user;
+  return { ...safeUser, selected_tags: parsedTags };
 };
 
 router.post('/', async (req, res) => {

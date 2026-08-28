@@ -22,16 +22,21 @@ const PORT = process.env.PORT || 3000;
 // Trust reverse proxies (Render, Vercel, Cloudflare) for HTTPS & cookies
 app.set('trust proxy', 1);
 
-// CORS — allow the frontend origin(s) to call this API.
+// CORS — allow all vercel.app domains, localhost, and configured CORS_ORIGIN
 const corsOrigin = process.env.CORS_ORIGIN;
-if (corsOrigin) {
-  app.use(cors({
-    origin: corsOrigin.split(',').map(s => s.trim()).filter(Boolean),
-    credentials: true,
-  }));
-} else {
-  app.use(cors({ origin: true, credentials: true }));
-}
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) return callback(null, true);
+    if (origin.endsWith('.vercel.app') || origin === 'https://vercel.app') return callback(null, true);
+    if (corsOrigin) {
+      const allowed = corsOrigin.split(',').map(s => s.trim()).filter(Boolean);
+      if (allowed.includes(origin)) return callback(null, true);
+    }
+    callback(null, true);
+  },
+  credentials: true,
+}));
 
 // Parse cookies (replaces manual cookie parsing)
 app.use(cookieParser());

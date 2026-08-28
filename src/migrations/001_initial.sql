@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS users (
   rating_max          INTEGER DEFAULT 1400,
   selected_tags       JSONB DEFAULT '[]'::jsonb,
   cursor_problem_id   TEXT DEFAULT NULL,
+  password_hash       TEXT DEFAULT NULL,
   created_at          TIMESTAMPTZ DEFAULT NOW(),
   updated_at          TIMESTAMPTZ DEFAULT NOW()
 );

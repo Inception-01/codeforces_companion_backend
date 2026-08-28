@@ -443,6 +443,26 @@ describe('CF Daily Grind Test Suite (PostgreSQL)', () => {
       assert.equal(rows.length, 1);
       assert.equal(rows[0].handle, 'TourisT');
     });
+
+    it('should securely hash password with bcrypt and verify login credentials', async () => {
+      const bcrypt = (await import('bcryptjs')).default;
+      const plainPassword = 'mySecretPassword123';
+      const hash = await bcrypt.hash(plainPassword, 10);
+
+      await pool.query(
+        "INSERT INTO users (handle, password_hash) VALUES ('pass_user', $1) ON CONFLICT (handle) DO UPDATE SET password_hash = $1",
+        [hash]
+      );
+
+      const { rows } = await pool.query('SELECT * FROM users WHERE handle = $1', ['pass_user']);
+      assert(rows[0].password_hash, 'password_hash should be stored');
+
+      const isMatch = await bcrypt.compare(plainPassword, rows[0].password_hash);
+      assert.equal(isMatch, true, 'Valid password must match bcrypt hash');
+
+      const isWrong = await bcrypt.compare('wrongPassword', rows[0].password_hash);
+      assert.equal(isWrong, false, 'Invalid password must be rejected');
+    });
   });
 
   // ---------- Solve History Tests ----------

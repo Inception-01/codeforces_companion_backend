@@ -1,0 +1,16 @@
+{
+  "name": "cf-daily-grind-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "test": "node test/api.test.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.2",
+    "cors": "^2.8.5",
+    "express": "^5.1.0"
+  }
+}

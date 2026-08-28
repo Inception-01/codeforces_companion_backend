@@ -1,18 +1,16 @@
 import express from 'express';
-import db from '../db.js';
+import { query, queryOne, execute, getClient } from '../db.js';
 import { fetchUserSubmissions } from '../cfApi.js';
-import { ensureProblemsCache } from '../problemCache.js';
+import { requireAuth, requireOwnership } from '../middleware/auth.js';
 
 const router = express.Router();
 
-router.post('/:userId', async (req, res) => {
+router.post('/:userId', requireAuth, requireOwnership, async (req, res) => {
   try {
-    const { userId } = req.params;
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    const user = req.user;
+    const userId = user.id;
 
+    // Fetch submissions from Codeforces API
     const submissions = await fetchUserSubmissions(user.handle);
     const accepted = (submissions || []).filter(s => s && s.verdict === 'OK' && s.problem);
 
@@ -32,41 +30,78 @@ router.post('/:userId', async (req, res) => {
     let syncedCount = 0;
     const newlySolved = [];
 
-    const getLogStmt = db.prepare('SELECT id, solved_at FROM problem_solve_log WHERE user_id = ? AND problem_id = ? AND solved_at IS NULL');
-    const updateLogStmt = db.prepare("UPDATE problem_solve_log SET solved_at = ?, verdict_checked_at = datetime('now') WHERE id = ?");
-    const insertHistoryStmt = db.prepare(`
-      INSERT OR REPLACE INTO solve_history 
-      (user_id, problem_id, solved_at, contest_id, problem_index, problem_name, problem_rating, problem_tags)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    const client = await getClient();
+    try {
+      await client.query('BEGIN');
 
-    db.transaction(() => {
       for (const [pid, sub] of earliestAccepted.entries()) {
         const solvedAt = new Date(sub.creationTimeSeconds * 1000).toISOString();
-        
-        insertHistoryStmt.run(
-          userId,
-          pid,
-          solvedAt,
-          sub.problem.contestId || null,
-          sub.problem.index || null,
-          sub.problem.name || pid,
-          typeof sub.problem.rating === 'number' ? sub.problem.rating : null,
-          JSON.stringify(Array.isArray(sub.problem.tags) ? sub.problem.tags : [])
+
+        let rating = typeof sub.problem.rating === 'number' ? sub.problem.rating : null;
+        let tags = Array.isArray(sub.problem.tags) ? sub.problem.tags : [];
+        let name = sub.problem.name || pid;
+
+        // If rating or tags are missing on the submission, enrich from local problem catalog
+        const cached = await client.query(
+          'SELECT name, rating, tags FROM problems_cache WHERE id = $1',
+          [pid]
+        );
+        if (cached.rows.length > 0) {
+          const cp = cached.rows[0];
+          if (rating === null && typeof cp.rating === 'number') rating = cp.rating;
+          if (tags.length === 0 && cp.tags) {
+            tags = typeof cp.tags === 'string' ? JSON.parse(cp.tags) : cp.tags;
+          }
+          if (name === pid && cp.name) name = cp.name;
+        }
+
+        await client.query(
+          `INSERT INTO solve_history
+           (user_id, problem_id, solved_at, contest_id, problem_index, problem_name, problem_rating, problem_tags)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (user_id, problem_id) DO UPDATE SET
+             solved_at = LEAST(solve_history.solved_at, EXCLUDED.solved_at),
+             problem_rating = COALESCE(solve_history.problem_rating, EXCLUDED.problem_rating),
+             problem_tags = CASE WHEN solve_history.problem_tags = '[]'::jsonb THEN EXCLUDED.problem_tags ELSE solve_history.problem_tags END,
+             problem_name = COALESCE(solve_history.problem_name, EXCLUDED.problem_name)`,
+          [
+            userId,
+            pid,
+            solvedAt,
+            sub.problem.contestId || null,
+            sub.problem.index || null,
+            name,
+            rating,
+            JSON.stringify(tags),
+          ]
         );
         syncedCount++;
 
-        const logEntries = getLogStmt.all(userId, pid);
-        for (const entry of logEntries) {
-          updateLogStmt.run(solvedAt, entry.id);
+        // Update unsolved log entries
+        const logEntries = await client.query(
+          'SELECT id FROM problem_solve_log WHERE user_id = $1 AND problem_id = $2 AND solved_at IS NULL',
+          [userId, pid]
+        );
+        for (const entry of logEntries.rows) {
+          await client.query(
+            'UPDATE problem_solve_log SET solved_at = $1, verdict_checked_at = NOW() WHERE id = $2',
+            [solvedAt, entry.id]
+          );
           newlySolved.push(pid);
         }
       }
-    })();
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
 
     res.json({
       synced: syncedCount,
-      newlySolved: [...new Set(newlySolved)]
+      newlySolved: [...new Set(newlySolved)],
     });
   } catch (error) {
     console.error('Error syncing submissions:', error);

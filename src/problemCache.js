@@ -1,18 +1,20 @@
-import db from './db.js';
+import { query, queryOne, execute, getClient } from './db.js';
 import { fetchAllProblems } from './cfApi.js';
 
 export async function ensureProblemsCache(forceRefresh = false) {
   const CACHE_TTL_HOURS = parseFloat(process.env.CACHE_TTL_HOURS || '6');
 
-  const countRow = db.prepare('SELECT COUNT(*) as count FROM problems_cache').get();
+  const countRow = await queryOne('SELECT COUNT(*)::int AS count FROM problems_cache');
   const existingCount = countRow ? countRow.count : 0;
 
   if (!forceRefresh && existingCount > 0) {
-    const row = db.prepare(`SELECT value, updated_at FROM cache_meta WHERE key = 'problems_last_fetched'`).get();
+    const row = await queryOne(
+      "SELECT value, updated_at FROM cache_meta WHERE key = 'problems_last_fetched'"
+    );
     if (row && row.updated_at) {
-      const lastFetched = new Date(row.updated_at.replace(' ', 'T') + 'Z');
-      const hoursSinceFetch = (Date.now() - (isNaN(lastFetched.getTime()) ? 0 : lastFetched.getTime())) / (1000 * 60 * 60);
-      if (hoursSinceFetch < CACHE_TTL_HOURS) {
+      const lastFetched = new Date(row.updated_at);
+      const hoursSinceFetch = (Date.now() - lastFetched.getTime()) / (1000 * 60 * 60);
+      if (!isNaN(hoursSinceFetch) && hoursSinceFetch < CACHE_TTL_HOURS) {
         return existingCount;
       }
     }
@@ -46,38 +48,71 @@ export async function ensureProblemsCache(forceRefresh = false) {
     }
   }
 
-  const insertStmt = db.prepare(`
-    INSERT OR REPLACE INTO problems_cache (id, contest_id, problem_index, name, rating, tags, solved_count)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM problems_cache');
 
-  const tx = db.transaction(() => {
-    db.prepare('DELETE FROM problems_cache').run();
+    // Batch insert for performance
+    const BATCH_SIZE = 500;
+    for (let i = 0; i < problems.length; i += BATCH_SIZE) {
+      const batch = problems.slice(i, i + BATCH_SIZE);
+      const values = [];
+      const params = [];
+      let paramIndex = 1;
 
-    for (const p of problems) {
-      if (!p || p.contestId === undefined || p.contestId === null || !p.index) continue;
-      const id = `${p.contestId}-${p.index}`;
-      const solvedCount = statsMap.get(id) || 0;
-      insertStmt.run(
-        id,
-        p.contestId,
-        String(p.index),
-        p.name || id,
-        typeof p.rating === 'number' ? p.rating : null,
-        JSON.stringify(Array.isArray(p.tags) ? p.tags : []),
-        solvedCount
-      );
+      for (const p of batch) {
+        if (!p || p.contestId === undefined || p.contestId === null || !p.index) continue;
+        const id = `${p.contestId}-${p.index}`;
+        const solvedCount = statsMap.get(id) || 0;
+        values.push(
+          `($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6})`
+        );
+        params.push(
+          id,
+          p.contestId,
+          String(p.index),
+          p.name || id,
+          typeof p.rating === 'number' ? p.rating : null,
+          JSON.stringify(Array.isArray(p.tags) ? p.tags : []),
+          solvedCount,
+        );
+        paramIndex += 7;
+      }
+
+      if (values.length > 0) {
+        await client.query(
+          `INSERT INTO problems_cache (id, contest_id, problem_index, name, rating, tags, solved_count)
+           VALUES ${values.join(', ')}
+           ON CONFLICT (id) DO UPDATE SET
+             contest_id = EXCLUDED.contest_id,
+             problem_index = EXCLUDED.problem_index,
+             name = EXCLUDED.name,
+             rating = EXCLUDED.rating,
+             tags = EXCLUDED.tags,
+             solved_count = EXCLUDED.solved_count,
+             fetched_at = NOW()`,
+          params
+        );
+      }
     }
 
-    db.prepare(`
-      INSERT OR REPLACE INTO cache_meta (key, value, updated_at) 
-      VALUES ('problems_last_fetched', 'true', datetime('now'))
-    `).run();
-  });
+    await client.query(
+      `INSERT INTO cache_meta (key, value, updated_at)
+       VALUES ('problems_last_fetched', 'true', NOW())
+       ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = NOW()`
+    );
 
-  tx();
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 
-  const finalCount = db.prepare('SELECT COUNT(*) as count FROM problems_cache').get().count;
+  const finalRow = await queryOne('SELECT COUNT(*)::int AS count FROM problems_cache');
+  const finalCount = finalRow ? finalRow.count : 0;
   console.log(`Successfully cached ${finalCount} problems.`);
   return finalCount;
 }

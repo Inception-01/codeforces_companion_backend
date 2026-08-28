@@ -1,5 +1,6 @@
 import express from 'express';
-import db from '../db.js';
+import { query, queryOne, execute } from '../db.js';
+import { requireAuth, requireOwnership } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -10,36 +11,32 @@ function nowMs() {
   return Date.now();
 }
 
-function getSession(userId) {
-  return db.prepare('SELECT * FROM arena_session WHERE user_id = ?').get(userId);
+async function getSession(userId) {
+  return queryOne('SELECT * FROM arena_session WHERE user_id = $1', [userId]);
 }
 
-// If the session is not idle and last_active is older than the window, discard it (no log).
-function cancelIfStale(userId) {
-  const session = getSession(userId);
+// If the session is not idle and last_active is older than the window, discard it.
+async function cancelIfStale(userId) {
+  const session = await getSession(userId);
   if (!session || session.state === 'idle') return session;
   const lastActive = session.last_active || session.started_at || 0;
   if (nowMs() - lastActive > INACTIVE_CANCEL_MS) {
-    db.prepare(
+    await execute(
       `UPDATE arena_session SET state='idle', problem_id=NULL, problem_name=NULL,
-        difficulty=NULL, accumulated_ms=0, started_at=NULL, last_active=?, updated_at=datetime('now')
-       WHERE user_id=?`
-    ).run(nowMs(), userId);
+        difficulty=NULL, accumulated_ms=0, started_at=NULL, last_active=$1, updated_at=NOW()
+       WHERE user_id=$2`,
+      [nowMs(), userId]
+    );
     return getSession(userId);
   }
   return session;
 }
 
-function touch(userId) {
-  db.prepare(`UPDATE arena_session SET last_active=?, updated_at=datetime('now') WHERE user_id=?`).run(nowMs(), userId);
-}
-
-
 function totalElapsedMs(session, now) {
   if (!session) return 0;
-  let base = session.accumulated_ms || 0;
+  let base = Number(session.accumulated_ms) || 0;
   if (session.state === 'running' && session.started_at) {
-    base += (now - session.started_at);
+    base += (now - Number(session.started_at));
   }
   return Math.max(0, Math.round(base));
 }
@@ -53,28 +50,36 @@ function serializeSession(session) {
     difficulty: session.difficulty || null,
     state: session.state || 'idle',
     elapsedMs: elapsed,
-    startedAt: session.started_at || null,
+    startedAt: session.started_at ? Number(session.started_at) : null,
     serverTime: now,
   };
 }
 
-function computeStats(userId) {
-  const rows = db.prepare(`
-    SELECT solved, time_ms, created_at FROM arena_log WHERE user_id = ? ORDER BY id ASC
-  `).all(userId);
+const IDLE_SESSION = { state: 'idle', elapsedMs: 0, problem_id: null, problem_name: null, difficulty: null, startedAt: null, serverTime: nowMs() };
+
+async function computeStats(userId) {
+  const rows = await query(
+    'SELECT solved, time_ms, created_at FROM arena_log WHERE user_id = $1 ORDER BY id ASC',
+    [userId]
+  );
 
   const solvedRows = rows.filter(r => r.solved === 1);
   const solved = solvedRows.length;
   const attempted = rows.length;
   const avgMs = solvedRows.length
-    ? Math.round(solvedRows.reduce((a, b) => a + b.time_ms, 0) / solvedRows.length)
+    ? Math.round(solvedRows.reduce((a, b) => a + Number(b.time_ms), 0) / solvedRows.length)
     : null;
   const fastestMs = solvedRows.length
-    ? Math.min(...solvedRows.map(r => r.time_ms))
+    ? Math.min(...solvedRows.map(r => Number(r.time_ms)))
     : null;
 
-  // consecutive days practiced, counting back from today
-  const days = new Set(rows.map(r => String(r.created_at).slice(0, 10)));
+  // Consecutive days practiced, counting back from today
+  const days = new Set(rows.map(r => {
+    const d = r.created_at instanceof Date
+      ? r.created_at.toISOString().slice(0, 10)
+      : String(r.created_at).slice(0, 10);
+    return d;
+  }));
   const today = new Date().toISOString().slice(0, 10);
   let streakDays = 0;
   let cursor = new Date(`${today}T00:00:00Z`);
@@ -89,42 +94,25 @@ function computeStats(userId) {
   }
   const totalDays = days.size;
 
-  return {
-    solved,
-    attempted,
-    avgMs,
-    fastestMs,
-    streakDays,
-    totalDays,
-  };
-}
-
-function getUserIdOr404(req, res) {
-  const { userId } = req.params;
-  const user = db.prepare('SELECT id FROM users WHERE id = ?').get(parseInt(userId, 10));
-  if (!user) {
-    res.status(404).json({ error: 'User not found' });
-    return null;
-  }
-  return user.id;
+  return { solved, attempted, avgMs, fastestMs, streakDays, totalDays };
 }
 
 // Current session + log + stats
-router.get('/:userId', (req, res) => {
-  const userId = getUserIdOr404(req, res);
-  if (userId === null) return;
+router.get('/:userId', requireAuth, requireOwnership, async (req, res) => {
   try {
-    cancelIfStale(userId);
-    const session = getSession(userId);
-    const log = db.prepare(`
-      SELECT id, problem_id, problem_name, difficulty, solved, time_ms, created_at
-      FROM arena_log WHERE user_id = ? ORDER BY id DESC LIMIT 50
-    `).all(userId);
+    const userId = req.user.id;
+    await cancelIfStale(userId);
+    const session = await getSession(userId);
+    const log = await query(
+      `SELECT id, problem_id, problem_name, difficulty, solved, time_ms, created_at
+       FROM arena_log WHERE user_id = $1 ORDER BY id DESC LIMIT 50`,
+      [userId]
+    );
 
     res.json({
-      session: session ? serializeSession(session) : { state: 'idle', elapsedMs: 0, problem_id: null, problem_name: null, difficulty: null, startedAt: null, serverTime: nowMs() },
+      session: session ? serializeSession(session) : { ...IDLE_SESSION, serverTime: nowMs() },
       log: log.map(r => ({ ...r, solved: !!r.solved })),
-      stats: computeStats(userId),
+      stats: await computeStats(userId),
     });
   } catch (error) {
     console.error('Error loading arena:', error.message);
@@ -132,38 +120,36 @@ router.get('/:userId', (req, res) => {
   }
 });
 
-// Start a session on a problem
-router.post('/:userId/start', (req, res) => {
-  const userId = getUserIdOr404(req, res);
-  if (userId === null) return;
+// Start a session
+router.post('/:userId/start', requireAuth, requireOwnership, async (req, res) => {
   try {
+    const userId = req.user.id;
     let { problemId, problemName, difficulty } = req.body || {};
     problemId = (problemId || '').trim() || null;
     problemName = (problemName || '').trim() || problemId;
     difficulty = ['easy', 'medium', 'hard'].includes(difficulty) ? difficulty : null;
 
-    // resolve problem metadata from cache if possible
     let name = problemName;
     if (problemId) {
-      const p = db.prepare(`SELECT id, name, contest_id, problem_index FROM problems_cache WHERE id = ?`).get(problemId);
+      const p = await queryOne(
+        'SELECT id, name, contest_id, problem_index FROM problems_cache WHERE id = $1',
+        [problemId]
+      );
       if (p) name = `${p.contest_id}${p.problem_index} · ${p.name}`;
     }
 
-    db.prepare(`
-      INSERT INTO arena_session (user_id, problem_id, problem_name, difficulty, state, accumulated_ms, started_at, last_active, updated_at)
-      VALUES (?, ?, ?, ?, 'running', 0, ?, ?, datetime('now'))
-      ON CONFLICT(user_id) DO UPDATE SET
-        problem_id = excluded.problem_id,
-        problem_name = excluded.problem_name,
-        difficulty = excluded.difficulty,
-        state = 'running',
-        accumulated_ms = 0,
-        started_at = excluded.started_at,
-        last_active = excluded.last_active,
-        updated_at = datetime('now')
-    `).run(userId, problemId, name, difficulty, nowMs(), nowMs());
+    const now = nowMs();
+    await execute(
+      `INSERT INTO arena_session (user_id, problem_id, problem_name, difficulty, state, accumulated_ms, started_at, last_active, updated_at)
+       VALUES ($1, $2, $3, $4, 'running', 0, $5, $5, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         problem_id = $2, problem_name = $3, difficulty = $4,
+         state = 'running', accumulated_ms = 0, started_at = $5, last_active = $5, updated_at = NOW()`,
+      [userId, problemId, name, difficulty, now]
+    );
 
-    res.json({ session: serializeSession(getSession(userId)) });
+    const session = await getSession(userId);
+    res.json({ session: serializeSession(session) });
   } catch (error) {
     console.error('Error starting arena:', error.message);
     res.status(500).json({ error: 'Failed to start session' });
@@ -171,22 +157,28 @@ router.post('/:userId/start', (req, res) => {
 });
 
 // Toggle pause / resume
-router.post('/:userId/pause', (req, res) => {
-  const userId = getUserIdOr404(req, res);
-  if (userId === null) return;
+router.post('/:userId/pause', requireAuth, requireOwnership, async (req, res) => {
   try {
-    const session = getSession(userId);
+    const userId = req.user.id;
+    const session = await getSession(userId);
     if (!session || session.state === 'idle') {
-      return res.json({ session: { state: 'idle', elapsedMs: 0, problem_id: null, problem_name: null, difficulty: null, startedAt: null, serverTime: nowMs() } });
+      return res.json({ session: { ...IDLE_SESSION, serverTime: nowMs() } });
     }
     const now = nowMs();
     if (session.state === 'running') {
-      const acc = (session.accumulated_ms || 0) + (now - (session.started_at || now));
-      db.prepare(`UPDATE arena_session SET state='paused', accumulated_ms=?, started_at=NULL, last_active=?, updated_at=datetime('now') WHERE user_id=?`).run(Math.round(acc), now, userId);
+      const acc = (Number(session.accumulated_ms) || 0) + (now - (Number(session.started_at) || now));
+      await execute(
+        `UPDATE arena_session SET state='paused', accumulated_ms=$1, started_at=NULL, last_active=$2, updated_at=NOW() WHERE user_id=$3`,
+        [Math.round(acc), now, userId]
+      );
     } else {
-      db.prepare(`UPDATE arena_session SET state='running', started_at=?, last_active=?, updated_at=datetime('now') WHERE user_id=?`).run(now, now, userId);
+      await execute(
+        `UPDATE arena_session SET state='running', started_at=$1, last_active=$1, updated_at=NOW() WHERE user_id=$2`,
+        [now, userId]
+      );
     }
-    res.json({ session: serializeSession(getSession(userId)) });
+    const updated = await getSession(userId);
+    res.json({ session: serializeSession(updated) });
   } catch (error) {
     console.error('Error pausing arena:', error.message);
     res.status(500).json({ error: 'Failed to pause session' });
@@ -194,11 +186,10 @@ router.post('/:userId/pause', (req, res) => {
 });
 
 // Finish the current problem (solved / dnf)
-router.post('/:userId/finish', (req, res) => {
-  const userId = getUserIdOr404(req, res);
-  if (userId === null) return;
+router.post('/:userId/finish', requireAuth, requireOwnership, async (req, res) => {
   try {
-    const session = getSession(userId);
+    const userId = req.user.id;
+    const session = await getSession(userId);
     if (!session || session.state === 'idle' || !session.problem_name) {
       return res.status(400).json({ error: 'No active session' });
     }
@@ -209,22 +200,27 @@ router.post('/:userId/finish', (req, res) => {
 
     const totalMs = totalElapsedMs(session, nowMs());
 
-    db.prepare(`
-      INSERT INTO arena_log (user_id, problem_id, problem_name, difficulty, solved, time_ms, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-    `).run(userId, session.problem_id, session.problem_name, difficulty, isSolved ? 1 : 0, totalMs);
+    await execute(
+      `INSERT INTO arena_log (user_id, problem_id, problem_name, difficulty, solved, time_ms, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [userId, session.problem_id, session.problem_name, difficulty, isSolved ? 1 : 0, totalMs]
+    );
 
-    db.prepare(`UPDATE arena_session SET state='idle', problem_id=NULL, problem_name=NULL, difficulty=NULL, accumulated_ms=0, started_at=NULL, updated_at=datetime('now') WHERE user_id=?`).run(userId);
+    await execute(
+      `UPDATE arena_session SET state='idle', problem_id=NULL, problem_name=NULL, difficulty=NULL, accumulated_ms=0, started_at=NULL, updated_at=NOW() WHERE user_id=$1`,
+      [userId]
+    );
 
-    const log = db.prepare(`
-      SELECT id, problem_id, problem_name, difficulty, solved, time_ms, created_at
-      FROM arena_log WHERE user_id = ? ORDER BY id DESC LIMIT 50
-    `).all(userId);
+    const log = await query(
+      `SELECT id, problem_id, problem_name, difficulty, solved, time_ms, created_at
+       FROM arena_log WHERE user_id = $1 ORDER BY id DESC LIMIT 50`,
+      [userId]
+    );
 
     res.json({
-      session: { state: 'idle', elapsedMs: 0, problem_id: null, problem_name: null, difficulty: null, startedAt: null, serverTime: nowMs() },
+      session: { ...IDLE_SESSION, serverTime: nowMs() },
       log: log.map(r => ({ ...r, solved: !!r.solved })),
-      stats: computeStats(userId),
+      stats: await computeStats(userId),
     });
   } catch (error) {
     console.error('Error finishing arena:', error.message);
@@ -233,12 +229,14 @@ router.post('/:userId/finish', (req, res) => {
 });
 
 // Discard active session without logging
-router.post('/:userId/reset', (req, res) => {
-  const userId = getUserIdOr404(req, res);
-  if (userId === null) return;
+router.post('/:userId/reset', requireAuth, requireOwnership, async (req, res) => {
   try {
-    db.prepare(`UPDATE arena_session SET state='idle', problem_id=NULL, problem_name=NULL, difficulty=NULL, accumulated_ms=0, started_at=NULL, updated_at=datetime('now') WHERE user_id=?`).run(userId);
-    res.json({ session: { state: 'idle', elapsedMs: 0, problem_id: null, problem_name: null, difficulty: null, startedAt: null, serverTime: nowMs() } });
+    const userId = req.user.id;
+    await execute(
+      `UPDATE arena_session SET state='idle', problem_id=NULL, problem_name=NULL, difficulty=NULL, accumulated_ms=0, started_at=NULL, updated_at=NOW() WHERE user_id=$1`,
+      [userId]
+    );
+    res.json({ session: { ...IDLE_SESSION, serverTime: nowMs() } });
   } catch (error) {
     console.error('Error resetting arena:', error.message);
     res.status(500).json({ error: 'Failed to reset session' });
@@ -246,12 +244,11 @@ router.post('/:userId/reset', (req, res) => {
 });
 
 // Clear the full log
-router.delete('/:userId/log', (req, res) => {
-  const userId = getUserIdOr404(req, res);
-  if (userId === null) return;
+router.delete('/:userId/log', requireAuth, requireOwnership, async (req, res) => {
   try {
-    db.prepare('DELETE FROM arena_log WHERE user_id = ?').run(userId);
-    res.json({ ok: true, stats: computeStats(userId) });
+    const userId = req.user.id;
+    await execute('DELETE FROM arena_log WHERE user_id = $1', [userId]);
+    res.json({ ok: true, stats: await computeStats(userId) });
   } catch (error) {
     console.error('Error clearing arena log:', error.message);
     res.status(500).json({ error: 'Failed to clear log' });
@@ -259,30 +256,35 @@ router.delete('/:userId/log', (req, res) => {
 });
 
 // Search problem cache for the picker
-router.get('/:userId/search', (req, res) => {
-  const userId = getUserIdOr404(req, res);
-  if (userId === null) return;
+router.get('/:userId/search', requireAuth, requireOwnership, async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
     const limit = Math.min(parseInt(req.query.limit) || 15, 50);
     let rows;
     if (q) {
-      rows = db.prepare(`
-        SELECT id, contest_id, problem_index, name, rating, tags
-        FROM problems_cache
-        WHERE id LIKE ? OR name LIKE ?
-        ORDER BY contest_id DESC, problem_index ASC
-        LIMIT ?
-      `).all(`%${q}%`, `%${q}%`, limit);
+      rows = await query(
+        `SELECT id, contest_id, problem_index, name, rating, tags
+         FROM problems_cache
+         WHERE id ILIKE $1 OR name ILIKE $1
+         ORDER BY contest_id DESC, problem_index ASC
+         LIMIT $2`,
+        [`%${q}%`, limit]
+      );
     } else {
-      rows = db.prepare(`
-        SELECT id, contest_id, problem_index, name, rating, tags
-        FROM problems_cache
-        ORDER BY contest_id DESC, problem_index ASC
-        LIMIT ?
-      `).all(limit);
+      rows = await query(
+        `SELECT id, contest_id, problem_index, name, rating, tags
+         FROM problems_cache
+         ORDER BY contest_id DESC, problem_index ASC
+         LIMIT $1`,
+        [limit]
+      );
     }
-    res.json({ problems: rows.map(r => ({ ...r, tags: JSON.parse(r.tags || '[]') })) });
+    res.json({
+      problems: rows.map(r => ({
+        ...r,
+        tags: typeof r.tags === 'string' ? JSON.parse(r.tags) : (r.tags || []),
+      })),
+    });
   } catch (error) {
     console.error('Error searching arena problems:', error.message);
     res.status(500).json({ error: 'Failed to search problems' });

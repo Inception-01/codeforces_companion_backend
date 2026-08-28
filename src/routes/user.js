@@ -1,22 +1,18 @@
 import express from 'express';
-import db from '../db.js';
+import { queryOne, execute } from '../db.js';
 import { fetchUserInfo } from '../cfApi.js';
-import { setUserCookie } from './auth.js';
+import { setUserCookie } from '../utils/cookies.js';
+import { requireAuth, requireOwnership } from '../middleware/auth.js';
 
 const router = express.Router();
 
 const formatUser = (user) => {
   if (!user) return null;
-  let parsedTags = [];
-  try {
-    parsedTags = typeof user.selected_tags === 'string' ? JSON.parse(user.selected_tags || '[]') : (user.selected_tags || []);
-  } catch (_) {
-    parsedTags = [];
+  let parsedTags = user.selected_tags || [];
+  if (typeof parsedTags === 'string') {
+    try { parsedTags = JSON.parse(parsedTags); } catch { parsedTags = []; }
   }
-  return {
-    ...user,
-    selected_tags: parsedTags
-  };
+  return { ...user, selected_tags: parsedTags };
 };
 
 router.post('/', async (req, res) => {
@@ -28,7 +24,6 @@ router.post('/', async (req, res) => {
 
     const trimmedHandle = handle.trim();
 
-    // Validate handle with Codeforces
     try {
       await fetchUserInfo(trimmedHandle);
     } catch (cfErr) {
@@ -36,8 +31,8 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: `Codeforces handle "${trimmedHandle}" was not found or could not be verified.` });
     }
 
-    db.prepare('INSERT OR IGNORE INTO users (handle) VALUES (?)').run(trimmedHandle);
-    const user = db.prepare('SELECT * FROM users WHERE handle = ?').get(trimmedHandle);
+    await execute('INSERT INTO users (handle) VALUES ($1) ON CONFLICT (handle) DO NOTHING', [trimmedHandle]);
+    const user = await queryOne('SELECT * FROM users WHERE handle = $1', [trimmedHandle]);
 
     setUserCookie(res, user);
 
@@ -48,30 +43,20 @@ router.post('/', async (req, res) => {
   }
 });
 
-router.get('/:id', (req, res) => {
+router.get('/:id', requireAuth, requireOwnership, (req, res) => {
   try {
-    const { id } = req.params;
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    res.json(formatUser(user));
+    res.json(formatUser(req.user));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch user' });
   }
 });
 
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', requireAuth, requireOwnership, async (req, res) => {
   try {
-    const { id } = req.params;
     const { daily_target_count, rating_min, rating_max, selected_tags, handle } = req.body;
+    const userId = req.user.id;
 
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    if (handle && handle !== user.handle) {
+    if (handle && handle !== req.user.handle) {
       try {
         await fetchUserInfo(handle.trim());
       } catch (cfErr) {
@@ -81,35 +66,48 @@ router.patch('/:id', async (req, res) => {
 
     const updates = [];
     const params = [];
+    let paramIdx = 1;
 
     if (daily_target_count !== undefined) {
-      updates.push('daily_target_count = ?');
+      updates.push(`daily_target_count = $${paramIdx++}`);
       params.push(Math.max(1, Math.min(20, parseInt(daily_target_count) || 3)));
     }
     if (rating_min !== undefined) {
-      updates.push('rating_min = ?');
-      params.push(parseInt(rating_min) || 0);
+      const minVal = parseInt(rating_min) || 0;
+      updates.push(`rating_min = $${paramIdx++}`);
+      params.push(minVal);
     }
     if (rating_max !== undefined) {
-      updates.push('rating_max = ?');
-      params.push(parseInt(rating_max) || 0);
+      const maxVal = parseInt(rating_max) || 0;
+      updates.push(`rating_max = $${paramIdx++}`);
+      params.push(maxVal);
     }
     if (selected_tags !== undefined) {
-      updates.push('selected_tags = ?');
-      params.push(typeof selected_tags === 'string' ? selected_tags : JSON.stringify(selected_tags));
+      updates.push(`selected_tags = $${paramIdx++}`);
+      params.push(JSON.stringify(Array.isArray(selected_tags) ? selected_tags : []));
     }
     if (handle !== undefined) {
-      updates.push('handle = ?');
+      updates.push(`handle = $${paramIdx++}`);
       params.push(handle.trim());
     }
 
     if (updates.length > 0) {
-      updates.push("updated_at = datetime('now')");
-      params.push(id);
-      db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+      // Validate rating_min <= rating_max after collecting all updates
+      const newMin = rating_min !== undefined ? (parseInt(rating_min) || 0) : req.user.rating_min;
+      const newMax = rating_max !== undefined ? (parseInt(rating_max) || 0) : req.user.rating_max;
+      if (newMin > newMax) {
+        return res.status(400).json({ error: 'rating_min must be <= rating_max' });
+      }
+
+      updates.push(`updated_at = NOW()`);
+      params.push(userId);
+      await execute(
+        `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramIdx}`,
+        params
+      );
     }
 
-    const updatedUser = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+    const updatedUser = await queryOne('SELECT * FROM users WHERE id = $1', [userId]);
     res.json(formatUser(updatedUser));
   } catch (error) {
     console.error('Error updating user:', error);

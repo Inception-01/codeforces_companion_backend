@@ -1,124 +1,208 @@
-import Database from 'better-sqlite3';
+import pg from 'pg';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-const dbPath = process.env.DB_PATH || './data/cf_daily_grind.db';
-const dbDir = path.dirname(dbPath);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
+// Load .env file automatically if present
+for (const envPath of [
+  path.resolve(process.cwd(), '.env'),
+  path.resolve(__dirname, '../../.env'),
+  path.resolve(__dirname, '../.env'),
+]) {
+  if (fs.existsSync(envPath)) {
+    try {
+      if (typeof process.loadEnvFile === 'function') {
+        process.loadEnvFile(envPath);
+      }
+    } catch (_) {}
+  }
 }
 
-const db = new Database(dbPath);
+const { Pool } = pg;
 
-// Enable WAL mode
-db.pragma('journal_mode = WAL');
-
-// Run migrations
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    handle TEXT NOT NULL UNIQUE,
-    daily_target_count INTEGER DEFAULT 3,
-    rating_min INTEGER DEFAULT 800,
-    rating_max INTEGER DEFAULT 1400,
-    selected_tags TEXT DEFAULT '[]',
-    cursor_problem_id TEXT DEFAULT NULL,
-    created_at TEXT DEFAULT (datetime('now')),
-    updated_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS problems_cache (
-    id TEXT PRIMARY KEY,
-    contest_id INTEGER NOT NULL,
-    problem_index TEXT NOT NULL,
-    name TEXT NOT NULL,
-    rating INTEGER,
-    tags TEXT DEFAULT '[]',
-    solved_count INTEGER DEFAULT 0,
-    fetched_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS daily_assignments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    date TEXT NOT NULL,
-    problem_ids TEXT NOT NULL,
-    generated_at TEXT DEFAULT (datetime('now')),
-    UNIQUE(user_id, date)
-  );
-
-  CREATE TABLE IF NOT EXISTS problem_solve_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    problem_id TEXT NOT NULL,
-    assigned_date TEXT,
-    solved_at TEXT,
-    verdict_checked_at TEXT,
-    UNIQUE(user_id, problem_id, assigned_date)
-  );
-
-  CREATE TABLE IF NOT EXISTS solve_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    problem_id TEXT NOT NULL,
-    solved_at TEXT NOT NULL,
-    contest_id INTEGER,
-    problem_index TEXT,
-    problem_name TEXT,
-    problem_rating INTEGER,
-    problem_tags TEXT DEFAULT '[]',
-    UNIQUE(user_id, problem_id)
-  );
-
-  CREATE TABLE IF NOT EXISTS cache_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT,
-    updated_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS learning_progress (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    article_key TEXT NOT NULL,
-    completed_at TEXT DEFAULT (datetime('now')),
-    UNIQUE(user_id, article_key)
-  );
-
-  CREATE TABLE IF NOT EXISTS arena_session (
-    user_id INTEGER PRIMARY KEY REFERENCES users(id),
-    problem_id TEXT,
-    problem_name TEXT,
-    difficulty TEXT,
-    state TEXT DEFAULT 'idle',
-    accumulated_ms INTEGER DEFAULT 0,
-    started_at INTEGER,
-    last_active INTEGER,
-    updated_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS arena_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    problem_id TEXT,
-    problem_name TEXT,
-    difficulty TEXT,
-    solved INTEGER NOT NULL DEFAULT 0,
-    time_ms INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_solve_history_user_date ON solve_history(user_id, solved_at);
-  CREATE INDEX IF NOT EXISTS idx_problems_cache_rating ON problems_cache(rating);
-  CREATE INDEX IF NOT EXISTS idx_daily_assignments_user_date ON daily_assignments(user_id, date);
-  CREATE INDEX IF NOT EXISTS idx_learning_progress_user ON learning_progress(user_id);
-  CREATE INDEX IF NOT EXISTS idx_arena_log_user ON arena_log(user_id, created_at);
-`);
-
-try {
-  db.prepare(`ALTER TABLE arena_session ADD COLUMN last_active INTEGER`).run();
-} catch (e) {
-  // column already exists
+// Determine connection URL with smart local defaults
+function getInitialDbUrl() {
+  if (process.env.DATABASE_URL) {
+    return process.env.DATABASE_URL;
+  }
+  // Local development default fallback
+  return 'postgres://localhost:5432/learn';
 }
 
-export default db;
+let activeUrl = getInitialDbUrl();
+
+function createPool(connUrl) {
+  return new Pool({
+    connectionString: connUrl,
+    ssl: process.env.NODE_ENV === 'production' && !connUrl.includes('localhost')
+      ? { rejectUnauthorized: false }
+      : false,
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+  });
+}
+
+let pool = createPool(activeUrl);
+
+pool.on('error', (err) => {
+  console.error('Unexpected PostgreSQL pool error:', err.message);
+});
+
+// Ensure target database exists; if 3D000 (db not found), auto-create or fallback
+async function ensureDatabaseConnection() {
+  try {
+    const testClient = await pool.connect();
+    testClient.release();
+    return pool;
+  } catch (err) {
+    // 3D000 = database does not exist
+    if (err.code === '3D000') {
+      console.warn(`Database specified in URL does not exist. Attempting auto-creation...`);
+      try {
+        const parsed = new URL(activeUrl);
+        const targetDbName = parsed.pathname.replace(/^\//, '');
+        const adminUrl = new URL(activeUrl);
+        adminUrl.pathname = '/postgres';
+
+        const adminPool = createPool(adminUrl.toString());
+        await adminPool.query(`CREATE DATABASE "${targetDbName.replace(/"/g, '""')}"`);
+        await adminPool.end();
+        console.log(`Database "${targetDbName}" created successfully.`);
+
+        // Reconnect with target DB
+        await pool.end().catch(() => {});
+        pool = createPool(activeUrl);
+        return pool;
+      } catch (createErr) {
+        console.warn(`Could not auto-create database (${createErr.message}). Falling back to existing database...`);
+        // Fall back to /learn or /postgres
+        for (const fallbackName of ['/learn', '/postgres']) {
+          try {
+            const fallbackUrl = new URL(activeUrl);
+            fallbackUrl.pathname = fallbackName;
+            const fallbackPool = createPool(fallbackUrl.toString());
+            const client = await fallbackPool.connect();
+            client.release();
+
+            await pool.end().catch(() => {});
+            activeUrl = fallbackUrl.toString();
+            pool = fallbackPool;
+            console.log(`Connected to fallback database: ${fallbackName.replace('/', '')}`);
+            return pool;
+          } catch (_) {}
+        }
+      }
+    }
+    throw err;
+  }
+}
+
+// Run migrations from the migrations/ directory
+async function runMigrations() {
+  await ensureDatabaseConnection();
+
+  // Ensure schema_migrations table exists
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version    INTEGER PRIMARY KEY,
+      applied_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  const migrationsDir = path.join(__dirname, 'migrations');
+  if (!fs.existsSync(migrationsDir)) {
+    console.warn('No migrations directory found at', migrationsDir);
+    return;
+  }
+
+  const files = fs.readdirSync(migrationsDir)
+    .filter(f => f.endsWith('.sql'))
+    .sort();
+
+  for (const file of files) {
+    const version = parseInt(file.split('_')[0], 10);
+    if (isNaN(version)) continue;
+
+    const { rows } = await pool.query(
+      'SELECT version FROM schema_migrations WHERE version = $1',
+      [version]
+    );
+
+    let shouldRun = rows.length === 0;
+    if (!shouldRun && version === 1) {
+      // Safety check: ensure core table actually exists in database
+      const checkTable = await pool.query(
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'problems_cache'"
+      );
+      if (checkTable.rows.length === 0) {
+        shouldRun = true;
+      }
+    }
+
+    if (shouldRun) {
+      console.log(`Running migration ${file}...`);
+      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf-8');
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(sql);
+        await client.query(
+          'INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING',
+          [version]
+        );
+        await client.query('COMMIT');
+        console.log(`Migration ${file} applied successfully.`);
+      } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(`Migration ${file} failed:`, err.message);
+        throw err;
+      } finally {
+        client.release();
+      }
+    }
+  }
+}
+
+// Helper: run a query and return all rows
+async function query(text, params) {
+  await dbReady;
+  const result = await pool.query(text, params);
+  return result.rows;
+}
+
+// Helper: run a query and return the first row or null
+async function queryOne(text, params) {
+  await dbReady;
+  const result = await pool.query(text, params);
+  return result.rows[0] || null;
+}
+
+// Helper: run a query and return the result (for INSERT/UPDATE/DELETE)
+async function execute(text, params) {
+  await dbReady;
+  return pool.query(text, params);
+}
+
+// Helper: get a client for transactions
+async function getClient() {
+  await dbReady;
+  return pool.connect();
+}
+
+// Graceful shutdown
+async function closePool() {
+  await pool.end();
+}
+
+// Initialize on import
+const dbReady = runMigrations().catch(err => {
+  console.error('Failed to initialize database:', err);
+  process.exit(1);
+});
+
+export { pool, query, queryOne, execute, getClient, closePool, dbReady };
+export default { pool, query, queryOne, execute, getClient, closePool, dbReady };

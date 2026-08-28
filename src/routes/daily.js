@@ -1,11 +1,11 @@
 import express from 'express';
-import db from '../db.js';
+import { query, queryOne, execute, getClient } from '../db.js';
 import { ensureProblemsCache } from '../problemCache.js';
+import { requireAuth, requireOwnership } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// Natural Codeforces problem-index ordering: oldest->newest ascending.
-// (Descending is achieved by negating the result.)
+// Natural Codeforces problem-index ordering helper for JS sort
 function cfIndexKey(index) {
   const m = String(index || '').match(/^([A-Z]+)(\d*)$/);
   let letterVal = 0;
@@ -22,43 +22,43 @@ function cfProblemCompareNewest(a, b) {
   return cfIndexKey(b.problem_index) - cfIndexKey(a.problem_index);
 }
 
-router.get('/:userId', async (req, res) => {
+router.get('/:userId', requireAuth, requireOwnership, async (req, res) => {
   try {
-    const { userId } = req.params;
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    const user = req.user;
+    const userId = user.id;
 
     const today = new Date().toISOString().split('T')[0];
-    let existingAssignment = db.prepare('SELECT * FROM daily_assignments WHERE user_id = ? AND date = ?').get(userId, today);
+    let existingAssignment = await queryOne(
+      'SELECT * FROM daily_assignments WHERE user_id = $1 AND date = $2',
+      [userId, today]
+    );
 
-    // Support force-regenerating today's problems (e.g. when rating level changes)
+    // Support force-regenerating today's problems
     if (req.query.force === '1' && existingAssignment) {
-      db.prepare('DELETE FROM daily_assignments WHERE user_id = ? AND date = ?').run(userId, today);
-      db.prepare('DELETE FROM problem_solve_log WHERE user_id = ? AND assigned_date = ?').run(userId, today);
+      await execute('DELETE FROM daily_assignments WHERE user_id = $1 AND date = $2', [userId, today]);
+      await execute('DELETE FROM problem_solve_log WHERE user_id = $1 AND assigned_date = $2', [userId, today]);
       existingAssignment = null;
     }
 
     let assignedProblemIds = [];
     if (existingAssignment) {
-      assignedProblemIds = JSON.parse(existingAssignment.problem_ids);
+      assignedProblemIds = typeof existingAssignment.problem_ids === 'string'
+        ? JSON.parse(existingAssignment.problem_ids)
+        : (existingAssignment.problem_ids || []);
     } else {
       // GENERATE
-      const solvedRows = db.prepare('SELECT problem_id FROM solve_history WHERE user_id = ?').all(userId);
+      const solvedRows = await query('SELECT problem_id FROM solve_history WHERE user_id = $1', [userId]);
       const solvedSet = new Set(solvedRows.map(r => r.problem_id));
 
-      const overdueRows = db.prepare(`
-        SELECT problem_id FROM problem_solve_log 
-        WHERE user_id = ? AND solved_at IS NULL AND assigned_date < ?
-      `).all(userId, today);
+      const overdueRows = await query(
+        'SELECT problem_id FROM problem_solve_log WHERE user_id = $1 AND solved_at IS NULL AND assigned_date < $2',
+        [userId, today]
+      );
       const overdueSet = new Set(overdueRows.map(r => r.problem_id));
 
       await ensureProblemsCache();
 
       // Optional ?level=XXXX overrides the saved rating range temporarily
-      // (used when the user picks a level chip on the Daily page without
-      // changing their saved Settings range). The user row is left untouched.
       let genMin = user.rating_min;
       let genMax = user.rating_max;
       if (req.query.level) {
@@ -69,29 +69,31 @@ router.get('/:userId', async (req, res) => {
         }
       }
 
-      let query = 'SELECT * FROM problems_cache WHERE rating >= ? AND rating <= ?';
-      const params = [genMin, genMax];
+      const selectedTags = Array.isArray(user.selected_tags) ? user.selected_tags : [];
 
-      const selectedTags = JSON.parse(user.selected_tags || '[]');
+      let allMatchingProblems;
       if (selectedTags.length > 0) {
-        const placeholders = selectedTags.map(() => '?').join(',');
-        query = `
-          SELECT DISTINCT p.* FROM problems_cache p
-          JOIN json_each(p.tags) t
-          WHERE p.rating >= ? AND p.rating <= ? AND t.value IN (${placeholders})
-        `;
-        params.push(...selectedTags);
+        // Build tag filter conditions
+        const tagConditions = selectedTags.map((t, i) => `p.tags @> $${i + 3}::jsonb`);
+        const tagParams = selectedTags.map(t => JSON.stringify([t]));
+        allMatchingProblems = await query(
+          `SELECT DISTINCT p.* FROM problems_cache p
+           WHERE p.rating >= $1 AND p.rating <= $2 AND (${tagConditions.join(' OR ')})
+           ORDER BY p.contest_id ASC, p.problem_index ASC`,
+          [genMin, genMax, ...tagParams]
+        );
+      } else {
+        allMatchingProblems = await query(
+          'SELECT * FROM problems_cache WHERE rating >= $1 AND rating <= $2 ORDER BY contest_id ASC, problem_index ASC',
+          [genMin, genMax]
+        );
       }
 
-      query += ' ORDER BY contest_id ASC, problem_index ASC';
-      const allMatchingProblems = db.prepare(query).all(...params);
-      // Re-sort in JS to pick the NEWEST problems first (highest contest_id /
-      // problem_index). Robust against SQLite's lexicographic string ordering.
+      // Re-sort in JS for newest-first selection
       allMatchingProblems.sort(cfProblemCompareNewest);
 
       const candidateProblems = allMatchingProblems.filter(p => !solvedSet.has(p.id) && !overdueSet.has(p.id));
 
-      // Serial selection: take the top N unsolved problems, newest first
       let selected = [];
       if (candidateProblems.length > 0) {
         const targetCount = Math.min(user.daily_target_count || 3, candidateProblems.length);
@@ -101,66 +103,79 @@ router.get('/:userId', async (req, res) => {
       assignedProblemIds = selected.map(p => p.id);
 
       if (assignedProblemIds.length > 0) {
-        db.transaction(() => {
-          db.prepare('INSERT OR REPLACE INTO daily_assignments (user_id, date, problem_ids) VALUES (?, ?, ?)').run(userId, today, JSON.stringify(assignedProblemIds));
-          
-          const insertLogStmt = db.prepare('INSERT OR IGNORE INTO problem_solve_log (user_id, problem_id, assigned_date) VALUES (?, ?, ?)');
+        const client = await getClient();
+        try {
+          await client.query('BEGIN');
+          await client.query(
+            `INSERT INTO daily_assignments (user_id, date, problem_ids)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (user_id, date) DO UPDATE SET problem_ids = $3`,
+            [userId, today, JSON.stringify(assignedProblemIds)]
+          );
+
           for (const pid of assignedProblemIds) {
-            insertLogStmt.run(userId, pid, today);
+            await client.query(
+              `INSERT INTO problem_solve_log (user_id, problem_id, assigned_date)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (user_id, problem_id, assigned_date) DO NOTHING`,
+              [userId, pid, today]
+            );
           }
 
-          db.prepare("UPDATE users SET cursor_problem_id = ?, updated_at = datetime('now') WHERE id = ?").run(assignedProblemIds[assignedProblemIds.length - 1], userId);
-        })();
+          await client.query(
+            'UPDATE users SET cursor_problem_id = $1, updated_at = NOW() WHERE id = $2',
+            [assignedProblemIds[assignedProblemIds.length - 1], userId]
+          );
+
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK');
+          throw err;
+        } finally {
+          client.release();
+        }
       }
     }
 
     // Fetch details for today
-    const getStatusStmt = db.prepare(`
-      SELECT p.*, l.solved_at 
-      FROM problems_cache p
-      JOIN problem_solve_log l ON p.id = l.problem_id
-      WHERE l.user_id = ? AND l.assigned_date = ? AND p.id = ?
-    `);
-    
-    const todayProblems = assignedProblemIds.map(pid => {
-      const res = getStatusStmt.get(userId, today, pid);
-      if (!res) {
-        const fallbackProblem = db.prepare('SELECT * FROM problems_cache WHERE id = ?').get(pid);
-        return fallbackProblem ? { ...fallbackProblem, solved_at: null, tags: JSON.parse(fallbackProblem.tags || '[]') } : null;
+    const todayProblems = [];
+    for (const pid of assignedProblemIds) {
+      let row = await queryOne(
+        `SELECT p.*, l.solved_at
+         FROM problems_cache p
+         JOIN problem_solve_log l ON p.id = l.problem_id
+         WHERE l.user_id = $1 AND l.assigned_date = $2 AND p.id = $3`,
+        [userId, today, pid]
+      );
+      if (!row) {
+        row = await queryOne('SELECT * FROM problems_cache WHERE id = $1', [pid]);
+        if (row) row.solved_at = null;
       }
-      let tags = [];
-      try {
-        tags = JSON.parse(res.tags || '[]');
-      } catch (_) {
-        tags = [];
+      if (row) {
+        row.tags = typeof row.tags === 'string' ? JSON.parse(row.tags) : (row.tags || []);
+        todayProblems.push(row);
       }
-      return { ...res, tags };
-    }).filter(Boolean);
+    }
 
-    // Fetch details for overdue (deduplicated by problem_id)
-    const rawOverdue = db.prepare(`
-      SELECT p.*, l.solved_at, l.assigned_date
-      FROM problems_cache p
-      JOIN problem_solve_log l ON p.id = l.problem_id
-      WHERE l.user_id = ? AND l.solved_at IS NULL AND l.assigned_date < ?
-      GROUP BY p.id
-      ORDER BY l.assigned_date DESC
-    `).all(userId, today);
+    // Fetch overdue (deduplicated by problem_id)
+    const rawOverdue = await query(
+      `SELECT DISTINCT ON (p.id) p.*, l.solved_at, l.assigned_date
+       FROM problems_cache p
+       JOIN problem_solve_log l ON p.id = l.problem_id
+       WHERE l.user_id = $1 AND l.solved_at IS NULL AND l.assigned_date < $2
+       ORDER BY p.id, l.assigned_date DESC`,
+      [userId, today]
+    );
 
-    const overdueDetails = rawOverdue.map(p => {
-      let tags = [];
-      try {
-        tags = JSON.parse(p.tags || '[]');
-      } catch (_) {
-        tags = [];
-      }
-      return { ...p, tags };
-    });
+    const overdueDetails = rawOverdue.map(p => ({
+      ...p,
+      tags: typeof p.tags === 'string' ? JSON.parse(p.tags) : (p.tags || []),
+    }));
 
     res.json({
       today: todayProblems,
       overdue: overdueDetails,
-      date: today
+      date: today,
     });
   } catch (error) {
     console.error('Error generating daily assignment:', error);
@@ -168,31 +183,37 @@ router.get('/:userId', async (req, res) => {
   }
 });
 
-router.get('/:userId/history', (req, res) => {
+router.get('/:userId/history', requireAuth, requireOwnership, async (req, res) => {
   try {
-    const { userId } = req.params;
-    const limit = parseInt(req.query.limit) || 30;
+    const userId = req.user.id;
+    const limit = Math.min(parseInt(req.query.limit) || 30, 100);
 
-    const assignments = db.prepare(`
-      SELECT * FROM daily_assignments 
-      WHERE user_id = ? 
-      ORDER BY date DESC LIMIT ?
-    `).all(userId, limit);
+    const assignments = await query(
+      'SELECT * FROM daily_assignments WHERE user_id = $1 ORDER BY date DESC LIMIT $2',
+      [userId, limit]
+    );
 
-    const history = assignments.map(a => {
-      const pids = JSON.parse(a.problem_ids);
-      const problems = pids.map(pid => {
-        const log = db.prepare(`
-          SELECT p.*, l.solved_at 
-          FROM problem_solve_log l
-          JOIN problems_cache p ON l.problem_id = p.id
-          WHERE l.user_id = ? AND l.problem_id = ? AND l.assigned_date = ?
-        `).get(userId, pid, a.date);
-        
-        return log ? { ...log, tags: JSON.parse(log.tags || '[]') } : { id: pid, missing: true };
-      });
-      return { ...a, problem_ids: pids, problems };
-    });
+    const history = [];
+    for (const a of assignments) {
+      const pids = typeof a.problem_ids === 'string' ? JSON.parse(a.problem_ids) : (a.problem_ids || []);
+      const problems = [];
+      for (const pid of pids) {
+        const log = await queryOne(
+          `SELECT p.*, l.solved_at
+           FROM problem_solve_log l
+           JOIN problems_cache p ON l.problem_id = p.id
+           WHERE l.user_id = $1 AND l.problem_id = $2 AND l.assigned_date = $3`,
+          [userId, pid, a.date]
+        );
+        if (log) {
+          log.tags = typeof log.tags === 'string' ? JSON.parse(log.tags) : (log.tags || []);
+          problems.push(log);
+        } else {
+          problems.push({ id: pid, missing: true });
+        }
+      }
+      history.push({ ...a, problem_ids: pids, problems });
+    }
 
     res.json(history);
   } catch (error) {

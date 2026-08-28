@@ -5,12 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch src/index.js",
-    "test": "node test/api.test.js",
+    "test": "node --test test/api.test.js",
     "start": "node src/index.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.8.2",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "pg": "^8.13.1"
   }
 }

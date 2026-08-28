@@ -1,6 +1,7 @@
 import express from 'express';
-import db from '../db.js';
+import { queryOne } from '../db.js';
 import { cfFetch, fetchUserInfo } from '../cfApi.js';
+import { requireAuth, requireOwnership } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -9,15 +10,15 @@ async function fetchRatingChanges(handle) {
   return Array.isArray(result) ? result : [];
 }
 
-router.get('/:userId', async (req, res) => {
+router.get('/:userId', requireAuth, requireOwnership, async (req, res) => {
   try {
-    const { userId } = req.params;
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    const user = req.user;
 
-    const totalSolved = db.prepare('SELECT COUNT(*) as c FROM solve_history WHERE user_id = ?').get(userId).c;
+    const countRow = await queryOne(
+      'SELECT COUNT(*)::int AS c FROM solve_history WHERE user_id = $1',
+      [user.id]
+    );
+    const totalSolved = countRow?.c || 0;
 
     let info = null;
     let ratingHistory = [];
@@ -41,7 +42,7 @@ router.get('/:userId', async (req, res) => {
         oldRating: c.oldRating,
         contestName: c.contestName,
         rank: c.rank,
-        time: c.ratingUpdateTimeSeconds * 1000
+        time: c.ratingUpdateTimeSeconds * 1000,
       }));
     } catch (err) {
       console.warn(`Failed to fetch rating changes for ${user.handle}:`, err.message);
@@ -52,7 +53,7 @@ router.get('/:userId', async (req, res) => {
       totalSolved,
       rating,
       maxRating,
-      ratingHistory
+      ratingHistory,
     });
   } catch (error) {
     console.error('Error fetching profile:', error);

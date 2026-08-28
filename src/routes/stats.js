@@ -1,27 +1,46 @@
 import express from 'express';
-import db from '../db.js';
+import { query, queryOne } from '../db.js';
 import { calculateStreaks } from '../utils/streaks.js';
 import { checkAutoAdvance } from '../utils/autoAdvance.js';
+import { requireAuth, requireOwnership } from '../middleware/auth.js';
 
 const router = express.Router();
 
-router.get('/:userId', (req, res) => {
+function formatLocalDate(dateVal, tz) {
+  const d = dateVal instanceof Date ? dateVal : new Date(dateVal);
+  if (isNaN(d.getTime())) return null;
+
+  if (tz) {
+    try {
+      // en-CA formats as YYYY-MM-DD
+      const formatter = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      });
+      return formatter.format(d);
+    } catch (_) {}
+  }
+  return d.toISOString().split('T')[0];
+}
+
+router.get('/:userId', requireAuth, requireOwnership, async (req, res) => {
   try {
-    const { userId } = req.params;
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    const userId = req.user.id;
+    const tz = req.query.tz || null;
 
-    const history = db.prepare('SELECT * FROM solve_history WHERE user_id = ?').all(userId);
+    const history = await query('SELECT * FROM solve_history WHERE user_id = $1 ORDER BY solved_at ASC', [userId]);
 
-    // 1. Heatmap
+    // 1. Heatmap — format dates with timezone awareness
     const heatmap = {};
     const dates = [];
     for (const h of history) {
-      const d = h.solved_at.split('T')[0];
-      heatmap[d] = (heatmap[d] || 0) + 1;
-      dates.push(d);
+      const d = formatLocalDate(h.solved_at, tz);
+      if (d) {
+        heatmap[d] = (heatmap[d] || 0) + 1;
+        dates.push(d);
+      }
     }
 
     // 2. Streaks
@@ -30,26 +49,28 @@ router.get('/:userId', (req, res) => {
     const streaks = {
       current: rawStreaks.currentStreak,
       longest: rawStreaks.longestStreak,
-      average: rawStreaks.totalActiveDays > 0 ? totalSolves / rawStreaks.totalActiveDays : 0,
+      average: rawStreaks.totalActiveDays > 0 ? +(totalSolves / rawStreaks.totalActiveDays).toFixed(1) : 0,
       currentStreak: rawStreaks.currentStreak,
       longestStreak: rawStreaks.longestStreak,
       totalActiveDays: rawStreaks.totalActiveDays,
     };
 
     // 3. Daily Completion
-    const assignments = db.prepare('SELECT * FROM daily_assignments WHERE user_id = ?').all(userId);
+    const assignments = await query('SELECT * FROM daily_assignments WHERE user_id = $1', [userId]);
     let days_fully_met = 0;
     let days_partially_met = 0;
     let days_missed = 0;
 
     for (const a of assignments) {
-      const pids = JSON.parse(a.problem_ids);
+      const pids = typeof a.problem_ids === 'string'
+        ? JSON.parse(a.problem_ids)
+        : (a.problem_ids || []);
       if (pids.length === 0) continue;
 
-      const logs = db.prepare(`
-        SELECT solved_at FROM problem_solve_log 
-        WHERE user_id = ? AND assigned_date = ?
-      `).all(userId, a.date);
+      const logs = await query(
+        'SELECT solved_at FROM problem_solve_log WHERE user_id = $1 AND assigned_date = $2',
+        [userId, a.date]
+      );
 
       const solvedCount = logs.filter(l => l.solved_at !== null).length;
       if (solvedCount === 0) {
@@ -67,17 +88,17 @@ router.get('/:userId', (req, res) => {
       missed: days_missed,
       days_fully_met,
       days_partially_met,
-      days_missed
+      days_missed,
     };
 
     // 4. Rating Distribution
     const ratingDistribution = {
       '<1200': 0, '1200-1399': 0, '1400-1599': 0, '1600-1899': 0,
-      '1900-2099': 0, '2100-2399': 0, '2400+': 0, 'unrated': 0
+      '1900-2099': 0, '2100-2399': 0, '2400+': 0, 'unrated': 0,
     };
     for (const h of history) {
       const r = h.problem_rating;
-      if (r === null) ratingDistribution['unrated']++;
+      if (r === null || r === undefined) ratingDistribution['unrated']++;
       else if (r < 1200) ratingDistribution['<1200']++;
       else if (r < 1400) ratingDistribution['1200-1399']++;
       else if (r < 1600) ratingDistribution['1400-1599']++;
@@ -90,14 +111,16 @@ router.get('/:userId', (req, res) => {
     // 5. Tag Breakdown
     const tagBreakdown = {};
     for (const h of history) {
-      const tags = JSON.parse(h.problem_tags || '[]');
+      const tags = typeof h.problem_tags === 'string'
+        ? JSON.parse(h.problem_tags)
+        : (h.problem_tags || []);
       for (const t of tags) {
         tagBreakdown[t] = (tagBreakdown[t] || 0) + 1;
       }
     }
 
     // 6. Auto Advance
-    const rawAutoAdvance = checkAutoAdvance(db, userId);
+    const rawAutoAdvance = await checkAutoAdvance(userId);
     const autoAdvance = rawAutoAdvance.suggest ? {
       suggest: true,
       min: rawAutoAdvance.newMin,
@@ -105,7 +128,7 @@ router.get('/:userId', (req, res) => {
       currentMin: rawAutoAdvance.currentMin,
       currentMax: rawAutoAdvance.currentMax,
       newMin: rawAutoAdvance.newMin,
-      newMax: rawAutoAdvance.newMax
+      newMax: rawAutoAdvance.newMax,
     } : null;
 
     res.json({
@@ -114,7 +137,7 @@ router.get('/:userId', (req, res) => {
       dailyCompletion,
       ratingDistribution,
       tagBreakdown,
-      autoAdvance
+      autoAdvance,
     });
   } catch (error) {
     console.error('Error fetching stats:', error);

@@ -1,5 +1,6 @@
 import express from 'express';
-import db from '../db.js';
+import { query, queryOne, execute } from '../db.js';
+import { requireAuth, requireOwnership } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -22,16 +23,10 @@ function articleUrl(path) {
   return `https://cp-algorithms.com/${p}.html`;
 }
 
-// Parse navigation.md (cp-algorithms literate-nav) into modules.
-// Format:
-//   - Module                      (indent 0, heading)
-//       - Submodule               (indent >0, heading, not an article)
-//           - [Title](x.md)       (indent >0, article) -> current submodule
-//       - [Direct Title](x.md)    (indent >0, article, before any submodule) -> module.articles
 function parseNavigation(text) {
   const modules = [];
-  let module = null;        // current module
-  let submodule = null;     // current submodule (null = articles belong to module)
+  let module = null;
+  let submodule = null;
 
   const isArticle = (line) => /\[[^\]]*\]\([^)]*\.md\)/.test(line);
 
@@ -145,11 +140,10 @@ router.get('/curriculum', async (req, res) => {
   }
 });
 
-router.get('/progress/:userId', async (req, res) => {
+router.get('/progress/:userId', requireAuth, requireOwnership, async (req, res) => {
   try {
-    const { userId } = req.params;
     const modules = await getCurriculum();
-    const rows = db.prepare('SELECT article_key FROM learning_progress WHERE user_id = ?').all(userId);
+    const rows = await query('SELECT article_key FROM learning_progress WHERE user_id = $1', [req.user.id]);
     const completed = new Set(rows.map(r => r.article_key));
     res.json({
       modules,
@@ -162,27 +156,30 @@ router.get('/progress/:userId', async (req, res) => {
   }
 });
 
-router.patch('/progress/:userId', async (req, res) => {
+router.patch('/progress/:userId', requireAuth, requireOwnership, async (req, res) => {
   try {
-    const { userId } = req.params;
     const { articleKey, completed } = req.body || {};
     if (!articleKey) return res.status(400).json({ error: 'articleKey is required' });
-
-    const user = db.prepare('SELECT id FROM users WHERE id = ?').get(userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
 
     const modules = await getCurriculum();
     if (!allArticleKeys(modules).has(articleKey)) {
       return res.status(400).json({ error: 'Unknown article key' });
     }
 
+    const userId = req.user.id;
     if (completed) {
-      db.prepare('INSERT OR IGNORE INTO learning_progress (user_id, article_key) VALUES (?, ?)').run(userId, articleKey);
+      await execute(
+        'INSERT INTO learning_progress (user_id, article_key) VALUES ($1, $2) ON CONFLICT (user_id, article_key) DO NOTHING',
+        [userId, articleKey]
+      );
     } else {
-      db.prepare('DELETE FROM learning_progress WHERE user_id = ? AND article_key = ?').run(userId, articleKey);
+      await execute(
+        'DELETE FROM learning_progress WHERE user_id = $1 AND article_key = $2',
+        [userId, articleKey]
+      );
     }
 
-    const rows = db.prepare('SELECT article_key FROM learning_progress WHERE user_id = ?').all(userId);
+    const rows = await query('SELECT article_key FROM learning_progress WHERE user_id = $1', [userId]);
     const completedSet = new Set(rows.map(r => r.article_key));
     res.json({ completedKeys: [...completedSet], summary: buildSummary(modules, completedSet) });
   } catch (error) {
